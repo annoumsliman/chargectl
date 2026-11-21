@@ -1,0 +1,181 @@
+#!/bin/bash
+# Installer for chargectl.
+set -eu
+
+PROG=${0##*/}
+SRC=$(cd "$(dirname "$0")" && pwd)/chargectl
+BIN=/usr/local/bin/chargectl
+UNIT=/etc/systemd/system/chargectl.service
+OLD_UNIT=/etc/systemd/system/battery-limit.service
+MARKER='# chargectl: battery charge control utility'
+UNIT_MARKER='# chargectl: managed by install.sh'
+
+die()  { echo "$PROG: $*" >&2; exit 1; }
+warn() { echo "$PROG: warning: $*" >&2; }
+info() { echo "$*"; }
+
+usage() {
+  cat <<EOF
+Usage: sudo $PROG [--force]
+  or:  sudo $PROG --persist START STOP [--force]
+  or:  sudo $PROG --uninstall
+
+Install chargectl to $BIN.
+
+  --persist START STOP   also create and enable a systemd service that
+                         applies the thresholds at every boot
+  --force                replace an existing '$BIN' that was not
+                         installed by this script (a backup is made)
+  --uninstall            remove chargectl and its service, and reset the
+                         battery to normal (charging enabled, 0% to 100%)
+  -h, --help             display this help and exit
+EOF
+}
+
+valid() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -le 100 ]; }
+
+MODE=install
+FORCE=no
+START=
+STOP=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --force) FORCE=yes; shift ;;
+    --uninstall) MODE=uninstall; shift ;;
+    --persist)
+      [ $# -ge 3 ] || die "option '--persist' requires two arguments: START STOP"
+      START=$2
+      STOP=$3
+      shift 3
+      ;;
+    *)
+      echo "$PROG: unrecognized option '$1'" >&2
+      echo "Try '$PROG --help' for more information." >&2
+      exit 1
+      ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "must be run as root (try: sudo $PROG ...)"
+
+have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
+do_install() {
+  [ -f "$SRC" ] || die "cannot find '$SRC' (keep install.sh next to chargectl)"
+  grep -qF "$MARKER" "$SRC" || die "'$SRC' does not look like chargectl"
+  bash -n "$SRC" || die "'$SRC' has a syntax error"
+
+  if [ -n "$START" ]; then
+    valid "$START" && valid "$STOP" ||
+      die "invalid values '$START' '$STOP': must be integers from 0 to 100"
+    [ "$START" -lt "$STOP" ] ||
+      die "invalid values '$START' '$STOP': START must be lower than STOP"
+    have_systemd || die "cannot use '--persist': systemd is not running"
+  fi
+
+  # Hardware check: refuse to install something that cannot work.
+  found=no
+  for b in /sys/class/power_supply/BAT*; do
+    if [ -e "$b/charge_control_end_threshold" ]; then
+      found=yes
+    fi
+  done
+  if [ "$found" = no ] && [ "$FORCE" = no ]; then
+    die "no battery with 'charge_control_end_threshold' found: charge limits are not supported on this machine (use --force to install anyway)"
+  fi
+
+  # Never overwrite a file we did not install.
+  if [ -e "$BIN" ] && ! grep -qF "$MARKER" "$BIN" 2>/dev/null; then
+    [ "$FORCE" = yes ] ||
+      die "'$BIN' already exists and was not installed by this script (use --force to back it up and replace it)"
+    backup="$BIN.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$BIN" "$backup"
+    info "backed up '$BIN' to '$backup'"
+  fi
+
+  # Atomic install: write a temporary file, then rename it into place.
+  tmp=$(mktemp "$BIN.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  install -m 0755 -o root -g root "$SRC" "$tmp"
+  mv -f "$tmp" "$BIN"
+  trap - EXIT
+  info "installed '$BIN'"
+
+  if have_systemd && systemctl is-active --quiet tlp 2>/dev/null; then
+    warn "TLP is active and may overwrite the thresholds at boot (see README.md)"
+  fi
+
+  if [ -n "$START" ]; then
+    # Test the values first: no service is created if they do not work.
+    "$BIN" "$START" "$STOP" ||
+      die "'chargectl $START $STOP' failed; the service was not created"
+
+    if [ -e "$UNIT" ] && ! grep -qF "$UNIT_MARKER" "$UNIT"; then
+      die "'$UNIT' already exists and was not created by this script"
+    fi
+    if [ -e "$OLD_UNIT" ]; then
+      warn "'$OLD_UNIT' exists (manual setup); disable it to avoid conflicts: systemctl disable --now battery-limit.service"
+    fi
+
+    tmp=$(mktemp "$UNIT.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    cat > "$tmp" <<EOF
+$UNIT_MARKER
+[Unit]
+Description=Set battery charge thresholds
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN $START $STOP
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$UNIT"
+    trap - EXIT
+
+    systemctl daemon-reload
+    systemctl enable --now chargectl.service
+    info "service enabled: thresholds $START-$STOP apply at every boot"
+  fi
+
+  info "done. Try: chargectl status"
+}
+
+do_uninstall() {
+  if [ -e "$UNIT" ]; then
+    grep -qF "$UNIT_MARKER" "$UNIT" ||
+      die "'$UNIT' was not created by this script; not removing it"
+    if have_systemd; then
+      systemctl disable --now chargectl.service || true
+    fi
+    rm -f "$UNIT"
+    if have_systemd; then
+      systemctl daemon-reload
+    fi
+    info "removed '$UNIT'"
+  fi
+
+  if [ -e "$BIN" ]; then
+    grep -qF "$MARKER" "$BIN" ||
+      die "'$BIN' was not installed by this script; not removing it"
+    # Leave the battery in its normal state; ignore unsupported features.
+    "$BIN" enable 2>/dev/null || true
+    "$BIN" 0 100 2>/dev/null || true
+    rm -f "$BIN"
+    info "removed '$BIN' (battery reset to normal where supported)"
+  else
+    info "'$BIN' is not installed"
+  fi
+}
+
+if [ "$MODE" = uninstall ]; then
+  do_uninstall
+else
+  do_install
+fi

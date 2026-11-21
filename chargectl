@@ -1,0 +1,240 @@
+#!/bin/bash
+# chargectl: battery charge control utility
+PROG=${0##*/}
+CONF=${CHARGECTL_CONF:-/etc/chargectl.conf}
+
+# Battery selection: CHARGECTL_BATTERY=BAT1 overrides autodetection.
+detect_battery() {
+  local b
+  if [ -n "$CHARGECTL_BATTERY" ]; then
+    echo "$CHARGECTL_BATTERY"
+    return
+  fi
+  for b in /sys/class/power_supply/BAT*; do
+    if [ -e "$b/charge_control_end_threshold" ]; then
+      echo "${b##*/}"
+      return
+    fi
+  done
+  echo BAT0
+}
+
+BAT=/sys/class/power_supply/$(detect_battery)
+START_FILE=$BAT/charge_control_start_threshold
+STOP_FILE=$BAT/charge_control_end_threshold
+BEHAVIOUR_FILE=$BAT/charge_behaviour
+
+usage() {
+  echo "Usage: $PROG START STOP [--persist]" >&2
+  echo "  or:  $PROG enable|disable" >&2
+  echo "  or:  $PROG status|forget" >&2
+  echo "Try '$PROG --help' for more information." >&2
+}
+
+die() {
+  echo "$PROG: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "$PROG: warning: $*" >&2
+}
+
+need_root() {   # need_root FILE
+  [ "$EUID" -eq 0 ] || die "cannot write '$1': Permission denied (are you root?)"
+}
+
+no_persist_opt() {   # no_persist_opt COMMAND
+  [ "$PERSIST" = no ] || die "option '--persist' cannot be used with '$1'"
+}
+
+write_value() {   # write_value VALUE FILE
+  local err
+  err=$(echo "$1" 2>&1 >"$2") || die "cannot write '$2': ${err##*: }"
+}
+
+check_values() {   # check_values START STOP
+  local v
+  for v in "$1" "$2"; do
+    [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 100 ] ||
+      die "invalid value '$v': must be an integer from 0 to 100"
+  done
+  [ "$1" -lt "$2" ] ||
+    die "invalid values '$1' '$2': START must be lower than STOP"
+}
+
+apply_thresholds() {   # apply_thresholds START STOP
+  local start=$1 stop=$2 cur_stop f
+  check_values "$start" "$stop"
+  for f in "$START_FILE" "$STOP_FILE"; do
+    [ -e "$f" ] || die "cannot access '$f': No such file or directory"
+  done
+  need_root "$STOP_FILE"
+  cur_stop=$(cat "$STOP_FILE") || die "cannot read '$STOP_FILE'"
+
+  # Raising the limit -> write STOP first; lowering it -> write START first.
+  if [ "$stop" -gt "$cur_stop" ]; then
+    write_value "$stop" "$STOP_FILE"
+    write_value "$start" "$START_FILE"
+  else
+    write_value "$start" "$START_FILE"
+    write_value "$stop" "$STOP_FILE"
+  fi
+}
+
+# Saved thresholds (applied at boot by chargectl.service).
+read_conf() {   # sets SAVED_START and SAVED_STOP; fails if invalid
+  SAVED_START=$(sed -n 's/^START=\([0-9]\{1,3\}\)$/\1/p' "$CONF" 2>/dev/null | head -n 1)
+  SAVED_STOP=$(sed -n 's/^STOP=\([0-9]\{1,3\}\)$/\1/p' "$CONF" 2>/dev/null | head -n 1)
+  [ -n "$SAVED_START" ] && [ -n "$SAVED_STOP" ]
+}
+
+save_conf() {   # save_conf START STOP
+  local tmp
+  need_root "$CONF"
+  tmp=$(mktemp "$CONF.XXXXXX") || die "cannot create '$CONF': Permission denied"
+  printf '# chargectl: saved thresholds, applied at boot\nSTART=%s\nSTOP=%s\n' "$1" "$2" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$CONF" || { rm -f "$tmp"; die "cannot write '$CONF'"; }
+}
+
+warn_if_no_service() {
+  if command -v systemctl >/dev/null 2>&1 &&
+     ! systemctl is-enabled --quiet chargectl.service 2>/dev/null; then
+    warn "chargectl.service is not enabled: saved thresholds will not be applied at boot (run install.sh)"
+  fi
+}
+
+set_charging() {   # set_charging auto|inhibit-charge
+  if [ ! -e "$BEHAVIOUR_FILE" ] || ! grep -qw inhibit-charge "$BEHAVIOUR_FILE"; then
+    die "cannot $ACTION charging: not supported by this battery (no 'inhibit-charge' in '$BEHAVIOUR_FILE')"
+  fi
+  need_root "$BEHAVIOUR_FILE"
+  write_value "$1" "$BEHAVIOUR_FILE"
+}
+
+show_status() {
+  local mode
+  [ -e "$START_FILE" ] && echo "Start threshold: $(cat "$START_FILE")%"
+  [ -e "$STOP_FILE" ]  && echo "Stop threshold:  $(cat "$STOP_FILE")%"
+  if [ -e "$BEHAVIOUR_FILE" ]; then
+    mode=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$BEHAVIOUR_FILE")
+    if [ "$mode" = "inhibit-charge" ]; then
+      echo "Charging:        disabled"
+    else
+      echo "Charging:        enabled"
+    fi
+  fi
+  if [ -f "$CONF" ]; then
+    if read_conf; then
+      echo "Saved for boot:  $SAVED_START% to $SAVED_STOP%"
+    else
+      echo "Saved for boot:  invalid ('$CONF')"
+    fi
+  else
+    echo "Saved for boot:  none"
+  fi
+}
+
+# Extract the --persist option from anywhere in the arguments.
+PERSIST=no
+args=()
+for a in "$@"; do
+  case "$a" in
+    -p|--persist) PERSIST=yes ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+
+case "$1" in
+  --help|-h)
+    cat <<EOF
+Usage: $PROG START STOP [--persist]
+  or:  $PROG enable|disable
+  or:  $PROG status|forget
+Control the charging of the battery $BAT.
+
+  START STOP   set the charge thresholds: start charging when the level
+               drops below START, stop charging when it reaches STOP
+               (integers from 0 to 100, START lower than STOP)
+  --persist    also save START and STOP, so they are applied again at
+               every boot (needs the service installed by install.sh)
+  enable       allow the battery to charge (default behaviour)
+  disable      stop the battery from charging, even when plugged in
+  status       show the current thresholds, charging state and saved values
+  forget       delete the saved thresholds (the current ones are kept
+               until the next reboot)
+
+Setting values, enable, disable and forget must be run as root.
+Saved values are stored in $CONF.
+Set CHARGECTL_BATTERY=BATx to select another battery.
+EOF
+    exit 0
+    ;;
+  enable|on)
+    ACTION=enable
+    no_persist_opt "$1"
+    [ $# -eq 1 ] || die "extra operand '$2'"
+    set_charging auto
+    exit 0
+    ;;
+  disable|off)
+    ACTION=disable
+    no_persist_opt "$1"
+    [ $# -eq 1 ] || die "extra operand '$2'"
+    set_charging inhibit-charge
+    exit 0
+    ;;
+  status)
+    no_persist_opt "$1"
+    [ $# -eq 1 ] || die "extra operand '$2'"
+    show_status
+    exit 0
+    ;;
+  restore)   # used by chargectl.service at boot
+    no_persist_opt "$1"
+    [ $# -eq 1 ] || die "extra operand '$2'"
+    [ -f "$CONF" ] || exit 0
+    read_conf || die "invalid configuration in '$CONF'"
+    apply_thresholds "$SAVED_START" "$SAVED_STOP"
+    exit 0
+    ;;
+  forget)
+    no_persist_opt "$1"
+    [ $# -eq 1 ] || die "extra operand '$2'"
+    need_root "$CONF"
+    rm -f "$CONF" || die "cannot remove '$CONF'"
+    exit 0
+    ;;
+esac
+
+# Otherwise: chargectl START STOP [--persist]
+if [ $# -eq 0 ]; then
+  if [ "$PERSIST" = yes ]; then
+    echo "$PROG: missing operand after '--persist'" >&2
+  else
+    echo "$PROG: missing operand" >&2
+  fi
+  usage
+  exit 1
+elif [ $# -eq 1 ]; then
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    echo "$PROG: missing operand after '$1'" >&2
+  else
+    echo "$PROG: invalid command '$1'" >&2
+  fi
+  usage
+  exit 1
+elif [ $# -gt 2 ]; then
+  echo "$PROG: extra operand '$3'" >&2
+  usage
+  exit 1
+fi
+
+apply_thresholds "$1" "$2"
+
+if [ "$PERSIST" = yes ]; then
+  save_conf "$1" "$2"
+  warn_if_no_service
+fi
